@@ -8,192 +8,143 @@ from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from dotenv import load_dotenv
 
-# Loglarni sozlash
 logging.basicConfig(level=logging.INFO)
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
-
-if not TOKEN:
-    raise ValueError("BOT_TOKEN topilmadi! Railway Variables qismini tekshiring.")
 
 bot = Bot(token=TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
 
-# ======================
-# STATES (FSM)
-# ======================
 class QuizState(StatesGroup):
     waiting_for_answer = State()
 
 # ======================
-# DATABASE (SQLite3)
+# YORDAMCHI FUNKSIYALAR (Smart Logic)
+# ======================
+
+def simplify_uz(text):
+    """ O'zbekcha matnni solishtirish uchun normallashtirish """
+    if not text: return ""
+    # Hammasini kichik harfga o'tkazish, bo'shliqlarni olib tashlash
+    text = text.strip().lower()
+    # Barcha turdagi apostrof va tutuq belgilarini bitta standartga keltirish
+    replacements = ["‘", "’", "`", "´", "ʻ", "ʼ"]
+    for char in replacements:
+        text = text.replace(char, "'")
+    return text
+
+def format_german(german, article):
+    """ Nemischa otlarni har doim katta harf bilan formatlash """
+    german = german.strip()
+    # Agar so'z ot bo'lsa (artikli bo'lsa), uni katta harf bilan boshlaymiz
+    if article and article.lower() in ['der', 'die', 'das']:
+        german = german.capitalize()
+    return f"{article.lower()} {german}" if article else german
+
+# ======================
+# DATABASE
 # ======================
 conn = sqlite3.connect("words.db", check_same_thread=False)
 cursor = conn.cursor()
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS words (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        german TEXT,
-        uzbek TEXT,
-        article TEXT,
-        archived INTEGER DEFAULT 0
+        german TEXT, uzbek TEXT, article TEXT, archived INTEGER DEFAULT 0
     )
 """)
 conn.commit()
 
-def add_word(german, uzbek, article=""):
-    cursor.execute("INSERT INTO words (german, uzbek, article) VALUES (?, ?, ?)", (german, uzbek, article))
-    conn.commit()
-
-def get_random_word():
-    cursor.execute("SELECT id, german, uzbek, article FROM words WHERE archived = 0 ORDER BY RANDOM() LIMIT 1")
-    return cursor.fetchone()
-
-def archive_word(word_id):
-    cursor.execute("UPDATE words SET archived = 1 WHERE id = ?", (word_id,))
-    conn.commit()
-
-def stats_data():
-    cursor.execute("SELECT COUNT(*) FROM words")
-    total = cursor.fetchone()[0]
-    cursor.execute("SELECT COUNT(*) FROM words WHERE archived = 1")
-    archived = cursor.fetchone()[0]
-    return total, archived, total - archived
-
-def parse_word(text):
-    if "-" not in text: return None
-    left, right = text.split("-", 1)
-    left, right = left.strip(), right.strip()
-    article = ""
-    german = left
-    for art in ["der ", "die ", "das "]:
-        if left.lower().startswith(art):
-            article = art.strip()
-            german = left[len(art):].strip()
-            break
-    return german, right, article
-
 # ======================
-# KEYBOARDS
+# HANDLERS
 # ======================
-def test_keyboard(word_id):
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("👁 Tarjima", callback_data=f"show_{word_id}"),
-        InlineKeyboardButton("✅ Yod oldim", callback_data=f"archive_{word_id}")
-    )
-    kb.add(InlineKeyboardButton("🔁 Keyingi so'z", callback_data="next"))
-    return kb
 
-# ======================
-# COMMANDS
-# ======================
 @dp.message_handler(commands=["start"], state="*")
 async def start(message: types.Message, state: FSMContext):
     await state.finish()
-    await message.answer(
-        "🇩🇪 **Nemis tili o'qituvchi botiga xush kelibsiz!**\n\n"
-        "🔹 **So'z qo'shish:** `der Tisch - stol` yoki ro'yxat ko'rinishida yuboring.\n"
-        "🔹 **O'rganish:** /test buyrug'ini bosing.\n"
-        "🔹 **Statistika:** /stats buyrug'ini bosing.",
-        parse_mode="Markdown"
-    )
-
-@dp.message_handler(commands=["stats"], state="*")
-async def show_stats(message: types.Message):
-    total, archived, active = stats_data()
-    await message.answer(f"📊 **Statistika:**\n\nJami: {total}\nYodlangan: {archived}\nAktiv: {active}", parse_mode="Markdown")
+    await message.answer("🇩🇪 **Deutsch Fenix v2.0**\n\n- So'z qo'shish: `der Tisch - stol` \n- Test: /test\n- Statistika: /stats", parse_mode="Markdown")
 
 @dp.message_handler(commands=["test"], state="*")
 async def test_word(message: types.Message, state: FSMContext):
-    word = get_random_word()
+    cursor.execute("SELECT id, german, uzbek, article FROM words WHERE archived = 0 ORDER BY RANDOM() LIMIT 1")
+    word = cursor.fetchone()
+    
     if not word:
-        await message.answer("⚠️ Hozircha aktiv so'zlar yo'q. Avval so'z qo'shing!")
+        await message.answer("⚠️ Aktiv so'zlar yo'q.")
         return
         
     word_id, german, uzbek, article = word
-    await state.update_data(correct_answer=uzbek, current_word_id=word_id, german_word=f"{article} {german}")
+    # Nemischa so'zni formatlash (Ot bo'lsa katta harf bilan)
+    display_word = format_german(german, article)
     
-    await message.answer(f"Bu so'zning tarjimasi nima?\n\n👉 **{article} {german}**", 
-                         reply_markup=test_keyboard(word_id), parse_mode="Markdown")
+    await state.update_data(correct_answer=uzbek, german_word=display_word)
+    
+    kb = InlineKeyboardMarkup().add(
+        InlineKeyboardButton("👁 Tarjima", callback_data=f"show_{word_id}"),
+        InlineKeyboardButton("✅ Yod oldim", callback_data=f"archive_{word_id}"),
+        InlineKeyboardButton("🔁 Keyingi", callback_data="next")
+    )
+    
+    await message.answer(f"Tarjimasi nima?\n\n👉 **{display_word}**", reply_markup=kb, parse_mode="Markdown")
     await QuizState.waiting_for_answer.set()
 
-# ======================
-# CALLBACKS
-# ======================
+@dp.message_handler(state=QuizState.waiting_for_answer)
+async def handle_quiz(message: types.Message, state: FSMContext):
+    if message.text.startswith('/'):
+        await state.finish()
+        # Komandani bajarish...
+        return
+
+    user_ans = simplify_uz(message.text)
+    data = await state.get_data()
+    correct_ans = simplify_uz(data.get("correct_answer"))
+    german_full = data.get("german_word")
+
+    if user_ans == correct_ans:
+        await message.reply(f"🌟 **BARAKALLA!**\n{german_full} = {message.text}")
+        await test_word(message, state)
+    else:
+        # Agar noto'g'ri bo'lsa, bazadagi original holatini ko'rsatadi
+        await message.answer(f"❌ **Xato!**\n\nTo'g'ri javob: `{data.get('correct_answer').upper()}`", parse_mode="Markdown")
+
+@dp.message_handler(state=None)
+async def bulk_add(message: types.Message):
+    lines = message.text.strip().split('\n')
+    added = 0
+    for line in lines:
+        if "-" in line:
+            left, right = line.split("-", 1)
+            left, right = left.strip(), right.strip()
+            
+            article = ""
+            german = left
+            for art in ["der ", "die ", "das "]:
+                if left.lower().startswith(art):
+                    article = art.strip()
+                    german = left[len(art):].strip().capitalize() # Bazaga saqlashda ham o'zi katta qilib qo'yadi
+                    break
+            
+            cursor.execute("INSERT INTO words (german, uzbek, article) VALUES (?, ?, ?)", (german, right, article))
+            added += 1
+    
+    if added > 0:
+        conn.commit()
+        await message.reply(f"✅ {added} ta so'z muvaffaqiyatli qo'shildi!")
+
 @dp.callback_query_handler(state="*")
-async def callbacks(call: types.CallbackQuery, state: FSMContext):
-    await call.answer()
+async def process_callback(call: types.CallbackQuery, state: FSMContext):
     if call.data == "next":
         await call.message.delete()
         await test_word(call.message, state)
-        
+    elif call.data.startswith("archive_"):
+        word_id = call.data.split("_")[1]
+        cursor.execute("UPDATE words SET archived = 1 WHERE id = ?", (word_id,))
+        conn.commit()
+        await call.message.answer("✅ Arxivlandi!")
+        await test_word(call.message, state)
     elif call.data.startswith("show_"):
         data = await state.get_data()
-        ans = data.get("correct_answer", "Xatolik!")
-        await call.message.answer(f"💡 To'g'ri javob: **{ans.upper()}**", parse_mode="Markdown")
-        
-    elif call.data.startswith("archive_"):
-        word_id = int(call.data.split("_")[1])
-        archive_word(word_id)
-        await call.message.answer("✅ Zo'r! Bu so'z yodlanganlar qatoriga qo'shildi.")
-        await test_word(call.message, state)
-
-# ======================
-# TEXT HANDLERS
-# ======================
-@dp.message_handler(state=QuizState.waiting_for_answer)
-async def handle_quiz(message: types.Message, state: FSMContext):
-    # Komandalar kelib qolsa testni to'xtatish
-    if message.text.startswith('/'):
-        await state.finish()
-        if message.text == "/test": await test_word(message, state)
-        elif message.text == "/stats": await show_stats(message)
-        elif message.text == "/start": await start(message, state)
-        return
-
-    user_answer = message.text.strip().lower()
-    data = await state.get_data()
-    correct_answer = data.get("correct_answer", "").lower()
-    german_full = data.get("german_word")
-
-    # Agar test ichida ham ro'yxat yuborsa
-    if "-" in message.text:
-        await state.finish()
-        await save_new_word(message)
-        return
-
-    if user_answer == correct_answer:
-        await message.reply(f"🌟 **TO'G'RI!**\n_{german_full}_ — _{user_answer}_", parse_mode="Markdown")
-        await test_word(message, state)
-    else:
-        await message.answer(
-            f"❌ Noto'g'ri!\n\nJavob: **{correct_answer.upper()}**\n\n"
-            "Qaytadan yozing yoki 'Keyingi so'z'ni bosing.", 
-            parse_mode="Markdown"
-        )
-
-@dp.message_handler(state=None)
-async def save_new_word(message: types.Message):
-    lines = message.text.strip().split('\n')
-    added_count = 0
-    
-    for line in lines:
-        if not line.strip(): continue
-        parsed = parse_word(line)
-        if parsed:
-            add_word(*parsed)
-            added_count += 1
-            
-    if added_count > 0:
-        await message.reply(f"✅ {added_count} ta so'z bazaga qo'shildi!")
-    else:
-        await message.answer(
-            "Tushunmadim 🥸\n\n"
-            "So'z qo'shish uchun: `der Tisch - stol` formatida yozing.\n"
-            "Bir vaqtning o'zida bir nechta so'zni qator tashlab yuborishingiz mumkin."
-        )
+        await call.answer(f"Javob: {data.get('correct_answer')}", show_alert=True)
 
 if __name__ == '__main__':
     executor.start_polling(dp, skip_updates=True)
