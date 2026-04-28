@@ -8,17 +8,20 @@ from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from dotenv import load_dotenv
 
-# Loglarni yoqish
+# Loglarni sozlash
 logging.basicConfig(level=logging.INFO)
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
+
+if not TOKEN:
+    raise ValueError("BOT_TOKEN topilmadi! Railway Variables qismini tekshiring.")
 
 bot = Bot(token=TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
 
 # ======================
-# STATES (Holatlar)
+# STATES (FSM)
 # ======================
 class QuizState(StatesGroup):
     waiting_for_answer = State()
@@ -39,7 +42,6 @@ cursor.execute("""
 """)
 conn.commit()
 
-# --- DB Funksiyalari ---
 def add_word(german, uzbek, article=""):
     cursor.execute("INSERT INTO words (german, uzbek, article) VALUES (?, ?, ?)", (german, uzbek, article))
     conn.commit()
@@ -89,10 +91,10 @@ def test_keyboard(word_id):
 # ======================
 @dp.message_handler(commands=["start"], state="*")
 async def start(message: types.Message, state: FSMContext):
-    await state.finish() # Har ehtimolga qarshi holatni tozalash
+    await state.finish()
     await message.answer(
         "🇩🇪 **Nemis tili o'qituvchi botiga xush kelibsiz!**\n\n"
-        "🔹 **So'z qo'shish:** `der Tisch - stol` shaklida yuboring.\n"
+        "🔹 **So'z qo'shish:** `der Tisch - stol` yoki ro'yxat ko'rinishida yuboring.\n"
         "🔹 **O'rganish:** /test buyrug'ini bosing.\n"
         "🔹 **Statistika:** /stats buyrug'ini bosing.",
         parse_mode="Markdown"
@@ -111,7 +113,6 @@ async def test_word(message: types.Message, state: FSMContext):
         return
         
     word_id, german, uzbek, article = word
-    # Ma'lumotlarni holatda saqlab turamiz
     await state.update_data(correct_answer=uzbek, current_word_id=word_id, german_word=f"{article} {german}")
     
     await message.answer(f"Bu so'zning tarjimasi nima?\n\n👉 **{article} {german}**", 
@@ -131,12 +132,12 @@ async def callbacks(call: types.CallbackQuery, state: FSMContext):
     elif call.data.startswith("show_"):
         data = await state.get_data()
         ans = data.get("correct_answer", "Xatolik!")
-        await call.message.answer(f"💡 Javob: **{ans.upper()}**", parse_mode="Markdown")
+        await call.message.answer(f"💡 To'g'ri javob: **{ans.upper()}**", parse_mode="Markdown")
         
     elif call.data.startswith("archive_"):
         word_id = int(call.data.split("_")[1])
         archive_word(word_id)
-        await call.message.answer("✅ Zo'r! Bu so'zni arxivga oldik.")
+        await call.message.answer("✅ Zo'r! Bu so'z yodlanganlar qatoriga qo'shildi.")
         await test_word(call.message, state)
 
 # ======================
@@ -144,12 +145,12 @@ async def callbacks(call: types.CallbackQuery, state: FSMContext):
 # ======================
 @dp.message_handler(state=QuizState.waiting_for_answer)
 async def handle_quiz(message: types.Message, state: FSMContext):
-    # Agar foydalanuvchi test vaqtida / komandasini yozsa
+    # Komandalar kelib qolsa testni to'xtatish
     if message.text.startswith('/'):
         await state.finish()
-        # Komandani qayta ishlash uchun xabarni "qaytarib" yuboramiz
         if message.text == "/test": await test_word(message, state)
         elif message.text == "/stats": await show_stats(message)
+        elif message.text == "/start": await start(message, state)
         return
 
     user_answer = message.text.strip().lower()
@@ -157,31 +158,42 @@ async def handle_quiz(message: types.Message, state: FSMContext):
     correct_answer = data.get("correct_answer", "").lower()
     german_full = data.get("german_word")
 
+    # Agar test ichida ham ro'yxat yuborsa
+    if "-" in message.text:
+        await state.finish()
+        await save_new_word(message)
+        return
+
     if user_answer == correct_answer:
         await message.reply(f"🌟 **TO'G'RI!**\n_{german_full}_ — _{user_answer}_", parse_mode="Markdown")
         await test_word(message, state)
     else:
-        # So'z qo'shish formatini tekshirish (test ichida ham so'z qo'shish imkoni)
-        parsed = parse_word(message.text)
+        await message.answer(
+            f"❌ Noto'g'ri!\n\nJavob: **{correct_answer.upper()}**\n\n"
+            "Qaytadan yozing yoki 'Keyingi so'z'ni bosing.", 
+            parse_mode="Markdown"
+        )
+
+@dp.message_handler(state=None)
+async def save_new_word(message: types.Message):
+    lines = message.text.strip().split('\n')
+    added_count = 0
+    
+    for line in lines:
+        if not line.strip(): continue
+        parsed = parse_word(line)
         if parsed:
             add_word(*parsed)
-            await message.reply("✅ Test to'xtatildi va yangi so'z saqlandi!")
-            await state.finish()
-        else:
-            await message.answer(
-                f"❌ Noto'g'ri!\n\nJavob: **{correct_answer.upper()}**\n\n"
-                "Qaytadan yozing yoki 'Keyingi so'z'ni bosing.", 
-                parse_mode="Markdown"
-            )
-
-@dp.message_handler(state=None) # Test rejimi bo'lmagan holatda
-async def save_new_word(message: types.Message):
-    parsed = parse_word(message.text)
-    if parsed:
-        add_word(*parsed)
-        await message.reply("✅ Yangi so'z bazaga qo'shildi!")
+            added_count += 1
+            
+    if added_count > 0:
+        await message.reply(f"✅ {added_count} ta so'z bazaga qo'shildi!")
     else:
-        await message.answer("Tushunmadim 🥸\n\nSo'z qo'shish uchun: `der Tisch - stol` formatida yozing.")
+        await message.answer(
+            "Tushunmadim 🥸\n\n"
+            "So'z qo'shish uchun: `der Tisch - stol` formatida yozing.\n"
+            "Bir vaqtning o'zida bir nechta so'zni qator tashlab yuborishingiz mumkin."
+        )
 
 if __name__ == '__main__':
     executor.start_polling(dp, skip_updates=True)
