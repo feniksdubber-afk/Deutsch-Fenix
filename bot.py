@@ -66,6 +66,11 @@ def parse_word_line(line):
 # Agar yo'q bo'lsa, joriy papkada
 DB_PATH = os.getenv("DB_PATH", "words.db")
 
+# Papka mavjud bo'lmasa, avtomatik yaratish
+db_dir = os.path.dirname(DB_PATH)
+if db_dir:
+    os.makedirs(db_dir, exist_ok=True)
+
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 cursor = conn.cursor()
 cursor.execute("""
