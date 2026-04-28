@@ -6,12 +6,16 @@ import logging
 import random
 import asyncio
 from datetime import date, datetime, timedelta
+import pytz
 from aiogram import Bot, Dispatcher, executor, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from gtts import gTTS
 from dotenv import load_dotenv
+
+TZ = pytz.timezone("Asia/Tashkent")  # UTC+5 — O'zbekiston vaqti
 
 logging.basicConfig(level=logging.INFO)
 load_dotenv()
@@ -42,7 +46,7 @@ class DeleteState(StatesGroup):
 # ======================
 # DATABASE
 # ======================
-DB_PATH = os.getenv("DB_PATH", "/data/words.db")
+DB_PATH = os.getenv("DB_PATH", "words.db")
 db_dir  = os.path.dirname(DB_PATH)
 if db_dir:
     os.makedirs(db_dir, exist_ok=True)
@@ -326,7 +330,7 @@ async def daily_reminder_loop():
     sent_today: set = set()
     while True:
         await asyncio.sleep(60)
-        now = datetime.now()
+        now = datetime.now(TZ)
         today_key = now.strftime("%Y-%m-%d")
 
         cursor.execute(
@@ -427,12 +431,13 @@ def _quiz_kb(word_id, next_cb="next"):
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
         InlineKeyboardButton("💡 Ko'rsatish",  callback_data=f"show_{word_id}"),
-        InlineKeyboardButton("✅ Yod oldim",   callback_data=f"archive_{word_id}"),
+        InlineKeyboardButton("🔊 Talaffuz",    callback_data=f"audio_{word_id}"),
     )
     kb.add(
+        InlineKeyboardButton("✅ Yod oldim",   callback_data=f"archive_{word_id}"),
         InlineKeyboardButton("🗑 O'chirish",    callback_data=f"delete_{word_id}"),
-        InlineKeyboardButton("⏭ Keyingisi",    callback_data=next_cb),
     )
+    kb.add(InlineKeyboardButton("⏭ Keyingisi", callback_data=next_cb))
     return kb
 
 # ======================
@@ -1007,6 +1012,44 @@ async def handle_article_answer(call: types.CallbackQuery, state: FSMContext):
             f"❌ *Xato!* Sen: `{chosen}`\n\nTo'g'ri: `{correct} {german}` = {uzbek}",
             reply_markup=kb, parse_mode="Markdown"
         )
+
+# ======================
+# /vaqt — vaqtni tekshirish
+# ======================
+@dp.message_handler(commands=["vaqt"], state="*")
+async def show_time(message: types.Message, state: FSMContext):
+    await state.finish()
+    now = datetime.now(TZ)
+    await message.answer(
+        f"🕐 *Bot vaqti (Toshkent):* `{now.strftime('%H:%M')}`\n"
+        f"📅 Sana: `{now.strftime('%Y-%m-%d')}`",
+        parse_mode="Markdown"
+    )
+
+# ======================
+# AUDIO TALAFFUZ
+# ======================
+@dp.callback_query_handler(lambda c: c.data.startswith("audio_"), state="*")
+async def send_audio(call: types.CallbackQuery, state: FSMContext):
+    await call.answer("🔊 Tayyorlanmoqda...")
+    word_id = int(call.data.split("_")[1])
+    cursor.execute("SELECT german, article FROM words WHERE id=?", (word_id,))
+    row = cursor.fetchone()
+    if not row:
+        await call.answer("❌ Topilmadi.", show_alert=True)
+        return
+    german, article = row
+    text = f"{article} {german}".strip() if article else german
+    try:
+        tts = gTTS(text=text, lang="de", slow=False)
+        buf = io.BytesIO()
+        tts.write_to_fp(buf)
+        buf.seek(0)
+        buf.name = "audio.mp3"
+        await call.message.answer_voice(buf, caption=f"🔊 *{text}*", parse_mode="Markdown")
+    except Exception as e:
+        logging.error(f"gTTS xato: {e}")
+        await call.message.answer("❌ Audio yuborishda xatolik. Internet bor-yo'qligini tekshiring.")
 
 # ======================
 # SO'Z QO'SHISH
