@@ -7,6 +7,7 @@ import random
 import asyncio
 from datetime import date, datetime, timedelta
 import pytz
+import httpx
 from aiogram import Bot, Dispatcher, executor, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.dispatcher import FSMContext
@@ -19,8 +20,9 @@ TZ = pytz.timezone("Asia/Tashkent")  # UTC+5 — O'zbekiston vaqti
 
 logging.basicConfig(level=logging.INFO)
 load_dotenv()
-TOKEN    = os.getenv("BOT_TOKEN")
-ADMIN_ID = os.getenv("ADMIN_ID")  # Kunlik eslatma uchun (ixtiyoriy)
+TOKEN     = os.getenv("BOT_TOKEN")
+ADMIN_ID  = os.getenv("ADMIN_ID")   # Kunlik eslatma uchun (ixtiyoriy)
+DEEPL_KEY = os.getenv("DEEPL_KEY", "622ac6d3-2e74-42fe-ba8c-a3bee328673e:fx")
 
 bot     = Bot(token=TOKEN)
 storage = MemoryStorage()
@@ -43,6 +45,13 @@ class ReminderState(StatesGroup):
 
 class DeleteState(StatesGroup):
     waiting_word = State()
+
+class TranslateState(StatesGroup):
+    waiting_word      = State()   # /tarjima — so'z kutish
+    waiting_confirm   = State()   # Foydalanuvchi o'zgartirmoqchi bo'lsa
+
+class GapState(StatesGroup):
+    waiting_word = State()        # /gap — so'z kutish
 
 # ======================
 # DATABASE
@@ -316,6 +325,65 @@ def pick_sr_word(category_id=None):
     return word
 
 # ======================
+# DEEPL TARJIMA YORDAMCHISI
+# ======================
+
+async def deepl_translate_en(text: str) -> str:
+    """
+    Nemischa so'zni inglizchaga tarjima qiladi (DeepL Free API).
+    Xatolikda None qaytaradi.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            r = await client.post(
+                "https://api-free.deepl.com/v2/translate",
+                data={
+                    "auth_key": DEEPL_KEY,
+                    "text": text,
+                    "source_lang": "DE",
+                    "target_lang": "EN",
+                },
+            )
+            data = r.json()
+            return data["translations"][0]["text"]
+    except Exception as e:
+        logging.warning(f"DeepL xato: {e}")
+        return None
+
+
+async def deepl_sentence_examples(word: str) -> str:
+    """
+    So'z yordamida DeepL orqali 3 ta nemischa gap tuzish uchun
+    oddiy prompt gaplar yaratadi (DeepL tarjimasi orqali).
+    Bu funksiya gap+tarjimasini qaytaradi.
+    """
+    # DeepL usage example sentences uchun ishlatiladi
+    examples = [
+        f"Ich benutze das Wort '{word}' jeden Tag.",
+        f"Können Sie '{word}' in einem Satz erklären?",
+        f"Das Wort '{word}' ist sehr wichtig.",
+    ]
+    results = []
+    for sent in examples:
+        try:
+            async with httpx.AsyncClient(timeout=8) as client:
+                r = await client.post(
+                    "https://api-free.deepl.com/v2/translate",
+                    data={
+                        "auth_key": DEEPL_KEY,
+                        "text": sent,
+                        "source_lang": "DE",
+                        "target_lang": "EN",
+                    },
+                )
+                data = r.json()
+                translated = data["translations"][0]["text"]
+                results.append(f"🇩🇪 _{sent}_\n🇬🇧 {translated}")
+        except Exception:
+            results.append(f"🇩🇪 _{sent}_")
+    return "\n\n".join(results)
+
+# ======================
 # FOYDALANUVCHI SOZLAMALARI
 # ======================
 
@@ -528,7 +596,10 @@ def _quiz_kb(word_id, next_cb="next"):
         InlineKeyboardButton("✅ Yod oldim",   callback_data=f"archive_{word_id}"),
         InlineKeyboardButton("🗑 O'chirish",    callback_data=f"delete_{word_id}"),
     )
-    kb.add(InlineKeyboardButton("⏭ Keyingisi", callback_data=next_cb))
+    kb.add(
+        InlineKeyboardButton("⏭ Keyingisi",   callback_data=next_cb),
+        InlineKeyboardButton("🏠 Menyu",       callback_data="go_home"),
+    )
     return kb
 
 # ======================
@@ -566,9 +637,13 @@ async def start(message: types.Message, state: FSMContext):
         InlineKeyboardButton("🗑 So'z o'chirish",   callback_data="menu_delete"),
         InlineKeyboardButton("📦 Arxiv",            callback_data="menu_archived"),
     )
+    kb.add(
+        InlineKeyboardButton("🔍 Tarjimasini bil",  callback_data="menu_translate"),
+        InlineKeyboardButton("📝 Gap tuzish",       callback_data="menu_gap"),
+    )
 
     await message.answer(
-        "🇩🇪 *Deutsch Fenix v4.0*\n\n"
+        "🇩🇪 *Deutsch Fenix v4.1*\n\n"
         "📥 *So'z qo'shish:*\n"
         "`der Tisch - stol`\n"
         "`laufen - yugurmoq`\n"
@@ -583,7 +658,7 @@ async def start(message: types.Message, state: FSMContext):
 @dp.callback_query_handler(lambda c: c.data in [
     "menu_test","menu_hard","menu_stats","menu_list",
     "menu_cats","menu_b1","menu_export","menu_delete","menu_archived",
-    "reminder_test"
+    "reminder_test","menu_translate","menu_gap"
 ], state="*")
 async def menu_callbacks(call: types.CallbackQuery, state: FSMContext):
     d = call.data
@@ -640,6 +715,26 @@ async def menu_callbacks(call: types.CallbackQuery, state: FSMContext):
     elif d == "menu_archived":
         await call.message.delete()
         await list_archived_send(call.message)
+
+    elif d == "menu_translate":
+        await call.message.answer(
+            "🔍 *Tarjimasini bilish*\n\n"
+            "Nemischa so'z yozing — inglizcha tarjimasini aytaman.\n"
+            "_(Hech narsa saqlanmaydi!)_\n\n"
+            "Bekor qilish: /start",
+            parse_mode="Markdown"
+        )
+        await TranslateState.waiting_word.set()
+
+    elif d == "menu_gap":
+        await call.message.answer(
+            "📝 *Gap tuzish*\n\n"
+            "Nemischa so'z yozing — o'sha so'z bilan gap tuzib, inglizcha tarjimasini beraman.\n"
+            "_(Hech narsa saqlanmaydi!)_\n\n"
+            "Bekor qilish: /start",
+            parse_mode="Markdown"
+        )
+        await GapState.waiting_word.set()
 
 # ======================
 # /test, /hard, /stats, /list, /archived, /kategoriya
@@ -1371,6 +1466,11 @@ async def process_callback(call: types.CallbackQuery, state: FSMContext):
     if d == "noop":
         await call.answer()
 
+    elif d == "go_home":
+        await state.finish()
+        await call.message.delete()
+        await start(call.message, state)
+
     elif d == "next":
         await call.message.delete()
         await send_test_question(call.message, state, category_id=cat_id)
@@ -1869,6 +1969,115 @@ async def cat_new_word_handler(message: types.Message, state: FSMContext):
         await message.reply("\n".join(parts), reply_markup=kb, parse_mode="Markdown")
 
     await state.finish()
+
+# ======================
+# TARJIMASINI BILISH (/tarjima) — hech narsa saqlanmaydi
+# ======================
+@dp.message_handler(commands=["tarjima"], state="*")
+async def tarjima_cmd(message: types.Message, state: FSMContext):
+    await state.finish()
+    await message.answer(
+        "🔍 *Tarjimasini bilish*\n\n"
+        "Nemischa so'z yozing — inglizcha tarjimasini aytaman.\n"
+        "_(Hech narsa saqlanmaydi!)_\n\n"
+        "Bekor qilish: /start",
+        parse_mode="Markdown"
+    )
+    await TranslateState.waiting_word.set()
+
+
+@dp.message_handler(state=TranslateState.waiting_word)
+async def translate_word_handler(message: types.Message, state: FSMContext):
+    if message.text.startswith("/"):
+        await state.finish()
+        return
+
+    word = message.text.strip()
+    await message.answer("⏳ Tarjima qilinmoqda...")
+
+    translation = await deepl_translate_en(word)
+
+    if not translation:
+        await message.answer(
+            "❌ Tarjima qilishda xatolik. Internet yoki API kalitini tekshiring."
+        )
+        await state.finish()
+        return
+
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("🔍 Yana so'rov", callback_data="menu_translate"),
+        InlineKeyboardButton("🏠 Menyu",       callback_data="go_home"),
+    )
+
+    await message.answer(
+        f"🇩🇪 *{word}*\n"
+        f"🇬🇧 `{translation}`\n\n"
+        f"_O'zbekchasi — o'zing top! 😄_",
+        reply_markup=kb,
+        parse_mode="Markdown"
+    )
+    await state.finish()
+
+
+# ======================
+# GAP TUZISH (/gap) — hech narsa saqlanmaydi
+# ======================
+@dp.message_handler(commands=["gap"], state="*")
+async def gap_cmd(message: types.Message, state: FSMContext):
+    await state.finish()
+    word = message.get_args()
+    if word:
+        await state.update_data(gap_word=word)
+        await _send_gap_examples(message, state, word)
+    else:
+        await message.answer(
+            "📝 *Gap tuzish*\n\n"
+            "Nemischa so'z yozing — o'sha so'z bilan gap tuzib, inglizcha tarjimasini beraman.\n"
+            "_(Hech narsa saqlanmaydi!)_\n\n"
+            "Bekor qilish: /start",
+            parse_mode="Markdown"
+        )
+        await GapState.waiting_word.set()
+
+
+@dp.message_handler(state=GapState.waiting_word)
+async def gap_word_handler(message: types.Message, state: FSMContext):
+    if message.text.startswith("/"):
+        await state.finish()
+        return
+    word = message.text.strip()
+    await _send_gap_examples(message, state, word)
+
+
+async def _send_gap_examples(message: types.Message, state: FSMContext, word: str):
+    await state.finish()
+    await message.answer("⏳ Gaplar tayyorlanmoqda...")
+
+    # 3 ta oddiy gap shabloni
+    sentences = [
+        f"Ich lerne das Wort \"{word}\" heute.",
+        f"Das Wort \"{word}\" ist sehr nützlich für mich.",
+        f"Können Sie \"{word}\" in einem Satz benutzen?",
+    ]
+
+    results = []
+    for sent in sentences:
+        en = await deepl_translate_en(sent)
+        if en:
+            results.append(f"🇩🇪 _{sent}_\n🇬🇧 {en}")
+        else:
+            results.append(f"🇩🇪 _{sent}_")
+
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("📝 Yana so'rov", callback_data="menu_gap"),
+        InlineKeyboardButton("🏠 Menyu",       callback_data="go_home"),
+    )
+
+    text = f"📝 *\"{word}\"* so'zi bilan gaplar:\n\n" + "\n\n".join(results)
+    await message.answer(text, reply_markup=kb, parse_mode="Markdown")
+
 
 # ======================
 # MAIN
