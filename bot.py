@@ -73,8 +73,10 @@ cursor.executescript("""
         next_review   TEXT DEFAULT NULL
     );
     CREATE TABLE IF NOT EXISTS categories (
-        id   INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL UNIQUE
+        id        INTEGER PRIMARY KEY AUTOINCREMENT,
+        name      TEXT NOT NULL,
+        parent_id INTEGER DEFAULT NULL,
+        UNIQUE(name, parent_id)
     );
     CREATE TABLE IF NOT EXISTS stats (
         id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -100,6 +102,7 @@ for col_sql in [
     "ALTER TABLE words ADD COLUMN interval      INTEGER DEFAULT 1",
     "ALTER TABLE words ADD COLUMN repetitions   INTEGER DEFAULT 0",
     "ALTER TABLE words ADD COLUMN next_review   TEXT DEFAULT NULL",
+    "ALTER TABLE categories ADD COLUMN parent_id INTEGER DEFAULT NULL",
 ]:
     try:
         cursor.execute(col_sql)
@@ -197,17 +200,28 @@ def format_german(german, article):
     return f"{article.lower()} {german}" if article else german
 
 def parse_word_line(line):
-    if "-" not in line:
+    """
+    Qatorni parse qiladi. Ajratuvchi sifatida ' – ', ' - ', '–', '-' ni qabul qiladi.
+    Ko'p so'zli iboralar ham ishlaydi (masalan: auf dem Land leben – ...).
+    """
+    # Barcha tire turlarini normallashtirish
+    normalized = line.replace(" – ", " - ").replace("–", " - ").replace("—", " - ")
+    if " - " not in normalized:
         return None
-    left, right = line.split("-", 1)
+    left, right = normalized.split(" - ", 1)
     left, right = left.strip(), right.strip()
     if not left or not right:
         return None
     article, german = "", left
-    for art in ["der ","die ","das "]:
+    for art in ["der ", "die ", "das "]:
         if left.lower().startswith(art):
             article = art.strip()
-            german  = left[len(art):].strip().capitalize()
+            german  = left[len(art):].strip()
+            # Artikl bor bo'lsa birinchi harf katta
+            if german and not any(c.islower() for c in german[:2]):
+                pass  # Allaqachon katta
+            else:
+                german = german[0].upper() + german[1:] if german else german
             break
     return article, german, right
 
@@ -427,6 +441,82 @@ async def send_test_question(message: types.Message, state: FSMContext, category
             reply_markup=art_kb, parse_mode="Markdown"
         )
         await QuizState.waiting_for_article.set()
+
+async def send_test_question_from_ids(message: types.Message, state: FSMContext, word_ids: list):
+    """ID ro'yxatidan (sub+parent) bitta so'z tanlash va savol berish"""
+    await state.finish()
+    if not word_ids:
+        await message.answer("⚠️ Bu bo'limlarda so'z yo'q.")
+        return
+
+    today = str(date.today())
+    # Bugun takrorlanishi kerak bo'lganlarni birinchi olish
+    placeholders = ",".join("?" * len(word_ids))
+    cursor.execute(
+        f"SELECT id, german, uzbek, article FROM words "
+        f"WHERE id IN ({placeholders}) AND archived=0 "
+        f"AND (next_review IS NULL OR next_review <= ?) ORDER BY RANDOM() LIMIT 1",
+        (*word_ids, today)
+    )
+    word = cursor.fetchone()
+    if not word:
+        cursor.execute(
+            f"SELECT id, german, uzbek, article FROM words "
+            f"WHERE id IN ({placeholders}) AND archived=0 ORDER BY RANDOM() LIMIT 1",
+            word_ids
+        )
+        word = cursor.fetchone()
+
+    if not word:
+        await message.answer("⚠️ So'z topilmadi.")
+        return
+
+    word_id, german, uzbek, article = word
+    display_german = format_german(german, article)
+    modes = ["de_uz", "uz_de"]
+    if article:
+        modes.append("article")
+    mode = random.choice(modes)
+
+    await state.update_data(
+        word_id=word_id, german=german, uzbek=uzbek,
+        article=article, display_german=display_german,
+        mode=mode, category_id=None, test_word_ids=word_ids
+    )
+
+    if mode == "de_uz":
+        await message.answer(
+            f"🇩🇪 ➜ 🇺🇿  *Tarjimasi nima?*\n\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"👉  *{display_german}*\n"
+            f"━━━━━━━━━━━━━━━",
+            reply_markup=_quiz_kb(word_id, "next_ids"), parse_mode="Markdown"
+        )
+    elif mode == "uz_de":
+        await message.answer(
+            f"🇺🇿 ➜ 🇩🇪  *Nemischasi nima?*\n\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"👉  *{uzbek}*\n"
+            f"━━━━━━━━━━━━━━━",
+            reply_markup=_quiz_kb(word_id, "next_ids"), parse_mode="Markdown"
+        )
+    else:
+        art_kb = InlineKeyboardMarkup(row_width=3)
+        art_kb.add(
+            InlineKeyboardButton("🔵 der", callback_data="art_der"),
+            InlineKeyboardButton("🔴 die", callback_data="art_die"),
+            InlineKeyboardButton("🟢 das", callback_data="art_das"),
+        )
+        art_kb.add(InlineKeyboardButton("⏭ Keyingisi", callback_data="next_ids"))
+        await message.answer(
+            f"🎯  *Artiklni toping:*\n\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"❓  *___ {german}*\n"
+            f"━━━━━━━━━━━━━━━",
+            reply_markup=art_kb, parse_mode="Markdown"
+        )
+    await QuizState.waiting_for_answer.set()
+
 
 def _quiz_kb(word_id, next_cb="next"):
     kb = InlineKeyboardMarkup(row_width=2)
@@ -694,16 +784,78 @@ async def kategoriya_menu(message: types.Message, state: FSMContext):
     await state.finish()
     await kategoriya_send(message, state)
 
-async def kategoriya_send(message: types.Message, state: FSMContext):
-    cursor.execute("SELECT id, name FROM categories ORDER BY name")
+async def kategoriya_send(message: types.Message, state: FSMContext, parent_id=None):
+    """
+    parent_id=None  → root kategoriyalar
+    parent_id=X     → X ning sub-kategoriyalari
+    """
+    if parent_id is None:
+        cursor.execute(
+            "SELECT id, name FROM categories WHERE parent_id IS NULL ORDER BY name"
+        )
+    else:
+        cursor.execute(
+            "SELECT id, name FROM categories WHERE parent_id=? ORDER BY name", (parent_id,)
+        )
     cats = cursor.fetchall()
-    kb   = InlineKeyboardMarkup(row_width=1)
-    kb.add(InlineKeyboardButton("➕ Yangi kategoriya", callback_data="cat_new"))
+
+    kb = InlineKeyboardMarkup(row_width=1)
+
+    # Yuqoriga qaytish (agar sub-daraja bo'lsa)
+    if parent_id is not None:
+        cursor.execute("SELECT id, name, parent_id FROM categories WHERE id=?", (parent_id,))
+        prow = cursor.fetchone()
+        back_cb = f"cat_open_{prow[0]}"
+        kb.add(InlineKeyboardButton("◀️ Orqaga", callback_data=back_cb))
+
+    kb.add(InlineKeyboardButton(
+        "➕ Yangi kategoriya",
+        callback_data=f"cat_new_{parent_id}" if parent_id else "cat_new_root"
+    ))
+
     for cat_id, cat_name in cats:
-        cursor.execute("SELECT COUNT(*) FROM words WHERE category_id=? AND archived=0", (cat_id,))
-        cnt = cursor.fetchone()[0]
-        kb.add(InlineKeyboardButton(f"📁 {cat_name} ({cnt} ta)", callback_data=f"cat_open_{cat_id}"))
-    await message.answer("📁 *Kategoriyalar:*", reply_markup=kb, parse_mode="Markdown")
+        # So'zlar soni (bu kategoriya + barcha sub-kategoriyalar)
+        direct_cnt = _count_words_recursive(cat_id)
+        sub_cnt = _count_subcats(cat_id)
+        label = f"📁 {cat_name} ({direct_cnt} so'z"
+        if sub_cnt:
+            label += f", {sub_cnt} bo'lim"
+        label += ")"
+        kb.add(InlineKeyboardButton(label, callback_data=f"cat_open_{cat_id}"))
+
+    title = "📁 *Kategoriyalar:*"
+    if parent_id is not None:
+        cursor.execute("SELECT name FROM categories WHERE id=?", (parent_id,))
+        pname = cursor.fetchone()
+        if pname:
+            title = f"📁 *{pname[0]}* — bo'limlar:"
+
+    await message.answer(title, reply_markup=kb, parse_mode="Markdown")
+
+
+def _count_words_recursive(cat_id):
+    """Kategoriya va barcha sub-kategoriyalaridagi so'zlar soni"""
+    cursor.execute("SELECT COUNT(*) FROM words WHERE category_id=? AND archived=0", (cat_id,))
+    count = cursor.fetchone()[0]
+    cursor.execute("SELECT id FROM categories WHERE parent_id=?", (cat_id,))
+    for (sub_id,) in cursor.fetchall():
+        count += _count_words_recursive(sub_id)
+    return count
+
+
+def _count_subcats(cat_id):
+    cursor.execute("SELECT COUNT(*) FROM categories WHERE parent_id=?", (cat_id,))
+    return cursor.fetchone()[0]
+
+
+def _get_all_word_ids_recursive(cat_id):
+    """Kategoriya va barcha sub-kategoriyalardan word id larni olish"""
+    cursor.execute("SELECT id FROM words WHERE category_id=? AND archived=0", (cat_id,))
+    ids = [r[0] for r in cursor.fetchall()]
+    cursor.execute("SELECT id FROM categories WHERE parent_id=?", (cat_id,))
+    for (sub_id,) in cursor.fetchall():
+        ids.extend(_get_all_word_ids_recursive(sub_id))
+    return ids
 
 # ======================
 # EKSPORT
@@ -1053,13 +1205,37 @@ async def send_audio(call: types.CallbackQuery, state: FSMContext):
         await call.message.answer("❌ Audio yuborishda xatolik. Internet bor-yo'qligini tekshiring.")
 
 # ======================
-# SO'Z QO'SHISH
+# SO'Z QO'SHISH (umumiy — state=None)
 # ======================
 @dp.message_handler(state=None)
 async def bulk_add(message: types.Message):
+    """
+    Oddiy so'z qo'shish va "Kategoriya:" formatini qo'llab-quvvatlaydi.
+    Agar matn ichida "NomKategoriya:" satri bo'lsa — keyingi so'zlar
+    o'sha kategoriyaga ham qo'shiladi.
+    """
     lines = message.text.strip().split('\n')
-    added, duplicates, errors = 0, [], []
 
+    # Avval "Kategoriya:" formati borligini aniqlash
+    has_cat_format = any(
+        l.strip().endswith(":") and not _looks_like_word_line(l.strip())
+        for l in lines if l.strip()
+    )
+
+    if has_cat_format:
+        await _bulk_add_with_categories(message, lines, parent_id=None)
+    else:
+        await _bulk_add_simple(message, lines, category_id=None)
+
+
+def _looks_like_word_line(line):
+    """'–' yoki ' - ' bo'lsa — so'z satri"""
+    return " – " in line or " - " in line or "–" in line
+
+
+async def _bulk_add_simple(message, lines, category_id):
+    """Kategoriyasiz yoki bitta kategoriyaga oddiy so'z qo'shish"""
+    added, duplicates, errors = 0, [], []
     for line in lines:
         line = line.strip()
         if not line:
@@ -1073,18 +1249,19 @@ async def bulk_add(message: types.Message):
             "SELECT id FROM words WHERE LOWER(german)=LOWER(?) AND LOWER(article)=LOWER(?)",
             (german, article)
         )
-        if cursor.fetchone():
+        existing = cursor.fetchone()
+        if existing:
+            if category_id:
+                cursor.execute("UPDATE words SET category_id=? WHERE id=?", (category_id, existing[0]))
             duplicates.append(format_german(german, article))
-            continue
-        cursor.execute(
-            "INSERT INTO words (german, uzbek, article) VALUES (?, ?, ?)",
-            (german, uzbek, article)
-        )
-        added += 1
-
-    if added > 0:
+        else:
+            cursor.execute(
+                "INSERT INTO words (german, uzbek, article, category_id) VALUES (?, ?, ?, ?)",
+                (german, uzbek, article, category_id)
+            )
+            added += 1
+    if added > 0 or duplicates:
         conn.commit()
-
     parts = []
     if added:
         parts.append(f"✅ *{added} ta so'z qo'shildi!*")
@@ -1094,8 +1271,93 @@ async def bulk_add(message: types.Message):
         parts.append(f"❓ Format noto'g'ri: {len(errors)} ta\n_Format: `der Tisch - stol`_")
     if not parts:
         parts.append("❓ Hech narsa qo'shilmadi.\n_Format: `der Tisch - stol`_")
-
     await message.reply("\n".join(parts), parse_mode="Markdown")
+
+
+async def _bulk_add_with_categories(message, lines, parent_id):
+    """
+    'Kategoriya:' + so'zlar formatini parse qilish.
+    parent_id — ota-kategoriya (None = root, int = sub-kategoriya ichida).
+    """
+    current_cat_id = None
+    current_cat_name = None
+    total_added = 0
+    total_dup   = 0
+    cats_created = []
+    errors = []
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+
+        # Kategoriya sarlavhasi: oxiri ':' bilan tugaydi va so'z satri emas
+        if line.endswith(":") and not _looks_like_word_line(line):
+            cat_name = line[:-1].strip()
+            if not cat_name:
+                continue
+            # Kategoriyani topish yoki yaratish
+            if parent_id is not None:
+                cursor.execute(
+                    "SELECT id FROM categories WHERE LOWER(name)=LOWER(?) AND parent_id=?",
+                    (cat_name, parent_id)
+                )
+            else:
+                cursor.execute(
+                    "SELECT id FROM categories WHERE LOWER(name)=LOWER(?) AND parent_id IS NULL",
+                    (cat_name,)
+                )
+            row = cursor.fetchone()
+            if row:
+                current_cat_id = row[0]
+            else:
+                cursor.execute(
+                    "INSERT INTO categories (name, parent_id) VALUES (?, ?)",
+                    (cat_name, parent_id)
+                )
+                conn.commit()
+                current_cat_id = cursor.lastrowid
+                cats_created.append(cat_name)
+            current_cat_name = cat_name
+            continue
+
+        # So'z satri
+        parsed = parse_word_line(line)
+        if not parsed:
+            errors.append(line)
+            continue
+        article, german, uzbek = parsed
+        cursor.execute(
+            "SELECT id FROM words WHERE LOWER(german)=LOWER(?) AND LOWER(article)=LOWER(?)",
+            (german, article)
+        )
+        existing = cursor.fetchone()
+        if existing:
+            if current_cat_id:
+                cursor.execute("UPDATE words SET category_id=? WHERE id=?", (current_cat_id, existing[0]))
+            total_dup += 1
+        else:
+            cursor.execute(
+                "INSERT INTO words (german, uzbek, article, category_id) VALUES (?, ?, ?, ?)",
+                (german, uzbek, article, current_cat_id)
+            )
+            total_added += 1
+
+    conn.commit()
+
+    parts = []
+    if cats_created:
+        parts.append(f"📁 Yaratildi: *{', '.join(cats_created)}*")
+    if total_added:
+        parts.append(f"✅ *{total_added} ta so'z* qo'shildi!")
+    if total_dup:
+        parts.append(f"🔗 Mavjud so'zlar kategoriyaga biriktirildi: *{total_dup} ta*")
+    if errors:
+        parts.append(f"❓ Format noto'g'ri: {len(errors)} ta")
+    if not parts:
+        parts.append("❓ Hech narsa qo'shilmadi.")
+    await message.reply("\n".join(parts), parse_mode="Markdown")
+
 
 # ======================
 # CALLBACK HANDLER (umumiy)
@@ -1106,9 +1368,20 @@ async def process_callback(call: types.CallbackQuery, state: FSMContext):
     st_data = await state.get_data()
     cat_id  = st_data.get("category_id")
 
-    if d == "next":
+    if d == "noop":
+        await call.answer()
+
+    elif d == "next":
         await call.message.delete()
         await send_test_question(call.message, state, category_id=cat_id)
+
+    elif d == "next_ids":
+        word_ids = st_data.get("test_word_ids")
+        await call.message.delete()
+        if word_ids:
+            await send_test_question_from_ids(call.message, state, word_ids)
+        else:
+            await send_test_question(call.message, state, category_id=cat_id)
 
     elif d == "hard_next":
         await call.message.delete()
@@ -1135,31 +1408,139 @@ async def process_callback(call: types.CallbackQuery, state: FSMContext):
         await call.answer(f"💡 Javob: {answer}" if answer else "⚠️ Ma'lumot topilmadi.", show_alert=True)
 
     # --- Kategoriya ---
+    elif d in ("cat_new_root",) or d.startswith("cat_new_"):
+        # parent_id aniqlash
+        if d == "cat_new_root":
+            p_id = None
+            p_label = "root"
+        else:
+            p_id = int(d.split("_")[2])
+            p_label = str(p_id)
+        await state.update_data(new_cat_parent_id=p_id)
+        await call.message.answer(
+            "📁 Yangi kategoriya nomini yozing:\n\n"
+            "Bekor qilish: /start"
+        )
+        await CategoryState.waiting_name.set()
+
     elif d == "cat_new":
-        await call.message.answer("📁 Yangi kategoriya nomini yozing:")
+        # Eski mos kelish (orqaga muvofiqlik)
+        await state.update_data(new_cat_parent_id=None)
+        await call.message.answer("📁 Yangi kategoriya nomini yozing:\n\nBekor qilish: /start")
         await CategoryState.waiting_name.set()
 
     elif d.startswith("cat_open_"):
         cid = int(d.split("_")[2])
+        cursor.execute("SELECT name, parent_id FROM categories WHERE id=?", (cid,))
+        row = cursor.fetchone()
+        if not row:
+            await call.answer("Topilmadi.", show_alert=True)
+            return
+        cat_name, cat_parent = row[0], row[1]
+
+        # Sub-kategoriyalar bor?
+        cursor.execute("SELECT id, name FROM categories WHERE parent_id=? ORDER BY name", (cid,))
+        subcats = cursor.fetchall()
+
+        direct_cnt  = _count_words_recursive(cid)
+        sub_cnt     = len(subcats)
+
+        kb = InlineKeyboardMarkup(row_width=1)
+
+        # Orqaga tugmasi
+        if cat_parent is not None:
+            kb.add(InlineKeyboardButton("◀️ Orqaga", callback_data=f"cat_open_{cat_parent}"))
+        else:
+            kb.add(InlineKeyboardButton("◀️ Kategoriyalar", callback_data="menu_cats"))
+
+        # Test — sub-kategoriya bor bo'lsa tanlov so'raydi
+        kb.add(InlineKeyboardButton("🎯 Test boshlash", callback_data=f"cat_test_choose_{cid}"))
+        kb.add(InlineKeyboardButton("📋 So'zlarini ko'rish", callback_data=f"cat_list_{cid}"))
+
+        # Sub-kategoriyalarni ko'rsatish
+        if subcats:
+            kb.add(InlineKeyboardButton("─── Bo'limlar ───", callback_data="noop"))
+            for sc_id, sc_name in subcats:
+                sc_cnt = _count_words_recursive(sc_id)
+                kb.add(InlineKeyboardButton(
+                    f"  📂 {sc_name} ({sc_cnt} so'z)",
+                    callback_data=f"cat_open_{sc_id}"
+                ))
+
+        kb.add(InlineKeyboardButton("─── Boshqarish ───", callback_data="noop"))
+        kb.add(InlineKeyboardButton("➕ So'z qo'shish",           callback_data=f"cat_addword_{cid}"))
+        kb.add(InlineKeyboardButton("📁 Yangi bo'lim qo'shish",   callback_data=f"cat_new_{cid}"))
+        kb.add(InlineKeyboardButton("🔗 Mavjud so'z biriktirish", callback_data=f"cat_assign_{cid}"))
+        kb.add(InlineKeyboardButton("🗑 Kategoriyani o'chirish",  callback_data=f"cat_del_{cid}"))
+
+        title = (
+            f"📁 *{cat_name}*\n"
+            f"_{direct_cnt} so'z"
+            + (f", {sub_cnt} bo'lim" if sub_cnt else "")
+            + "_"
+        )
+        try:
+            await call.message.edit_text(title, reply_markup=kb, parse_mode="Markdown")
+        except Exception:
+            await call.message.answer(title, reply_markup=kb, parse_mode="Markdown")
+
+    elif d.startswith("cat_test_choose_"):
+        cid = int(d.split("_")[3])
         cursor.execute("SELECT name FROM categories WHERE id=?", (cid,))
         row = cursor.fetchone()
         if not row:
             await call.answer("Topilmadi.", show_alert=True)
             return
-        cursor.execute("SELECT COUNT(*) FROM words WHERE category_id=? AND archived=0", (cid,))
-        cnt = cursor.fetchone()[0]
+        cat_name = row[0]
+
+        cursor.execute("SELECT id, name FROM categories WHERE parent_id=? ORDER BY name", (cid,))
+        subcats = cursor.fetchall()
+
+        if not subcats:
+            # Sub-kategoriya yo'q — to'g'ridan test
+            await state.update_data(active_category=cid, test_word_ids=None)
+            await call.message.delete()
+            await send_test_question(call.message, state, category_id=cid)
+            return
+
+        # Tanlov klaviaturasi
         kb = InlineKeyboardMarkup(row_width=1)
-        kb.add(
-            InlineKeyboardButton("🎯 Test boshlash",            callback_data=f"cat_test_{cid}"),
-            InlineKeyboardButton("📋 So'zlarini ko'rish",        callback_data=f"cat_list_{cid}"),
-            InlineKeyboardButton("➕ So'z qo'shish",             callback_data=f"cat_addword_{cid}"),
-            InlineKeyboardButton("🔗 Mavjud so'z biriktirish",   callback_data=f"cat_assign_{cid}"),
-            InlineKeyboardButton("🗑 Kategoriyani o'chirish",    callback_data=f"cat_del_{cid}"),
-        )
-        await call.message.edit_text(
-            f"📁 *{row[0]}*\n_{cnt} ta so'z_",
-            reply_markup=kb, parse_mode="Markdown"
-        )
+        all_ids = _get_all_word_ids_recursive(cid)
+        kb.add(InlineKeyboardButton(
+            f"📚 Umumiy ({len(all_ids)} so'z)",
+            callback_data=f"cat_test_all_{cid}"
+        ))
+        for sc_id, sc_name in subcats:
+            sc_cnt = _count_words_recursive(sc_id)
+            kb.add(InlineKeyboardButton(
+                f"📂 {sc_name} ({sc_cnt} so'z)",
+                callback_data=f"cat_test_{sc_id}"
+            ))
+        kb.add(InlineKeyboardButton("◀️ Orqaga", callback_data=f"cat_open_{cid}"))
+
+        try:
+            await call.message.edit_text(
+                f"🎯 *{cat_name}* — Qaysi mavzudan test?",
+                reply_markup=kb, parse_mode="Markdown"
+            )
+        except Exception:
+            await call.message.answer(
+                f"🎯 *{cat_name}* — Qaysi mavzudan test?",
+                reply_markup=kb, parse_mode="Markdown"
+            )
+
+    elif d.startswith("cat_test_all_"):
+        # Ota-kategoriya + barcha sub-kategoriyalar so'zlari
+        cid = int(d.split("_")[3])
+        word_ids = _get_all_word_ids_recursive(cid)
+        if not word_ids:
+            await call.answer("Bu kategoriyada so'z yo'q!", show_alert=True)
+            return
+        await state.update_data(active_category=cid, test_word_ids=word_ids)
+        await call.message.delete()
+        await send_test_question_from_ids(call.message, state, word_ids)
+
+
 
     elif d.startswith("cat_addword_"):
         cid = int(d.split("_")[2])
@@ -1350,13 +1731,29 @@ async def process_callback(call: types.CallbackQuery, state: FSMContext):
 @dp.message_handler(state=CategoryState.waiting_name)
 async def cat_save_name(message: types.Message, state: FSMContext):
     name = message.text.strip()
-    if not name:
-        await message.answer("❌ Nom bo'sh bo'lishi mumkin emas.")
+    if not name or message.text.startswith("/"):
+        await state.finish()
         return
+    data      = await state.get_data()
+    parent_id = data.get("new_cat_parent_id")  # None = root
+
     try:
-        cursor.execute("INSERT INTO categories (name) VALUES (?)", (name,))
+        cursor.execute(
+            "INSERT INTO categories (name, parent_id) VALUES (?, ?)",
+            (name, parent_id)
+        )
         conn.commit()
-        await message.answer(f"✅ *{name}* kategoriyasi yaratildi!", parse_mode="Markdown")
+        new_id = cursor.lastrowid
+        if parent_id is not None:
+            cursor.execute("SELECT name FROM categories WHERE id=?", (parent_id,))
+            pname = cursor.fetchone()
+            pname = pname[0] if pname else "kategoriya"
+            await message.answer(
+                f"✅ *{name}* bo'limi *{pname}* ichiga yaratildi!",
+                parse_mode="Markdown"
+            )
+        else:
+            await message.answer(f"✅ *{name}* kategoriyasi yaratildi!", parse_mode="Markdown")
     except sqlite3.IntegrityError:
         await message.answer(f"⚠️ *{name}* allaqachon mavjud.", parse_mode="Markdown")
     await state.finish()
@@ -1402,7 +1799,8 @@ async def cat_assign_words(message: types.Message, state: FSMContext):
 
 @dp.message_handler(state=CategoryState.waiting_new_word)
 async def cat_new_word_handler(message: types.Message, state: FSMContext):
-    """Kategoriyaga to'g'ridan-to'g'ri yangi so'z qo'shish"""
+    """Kategoriyaga to'g'ridan-to'g'ri yangi so'z qo'shish.
+    'Bo'lim:' formatini ham qo'llab-quvvatlaydi — sub-kategoriyalar yaratadi."""
     if message.text.startswith("/"):
         await state.finish()
         return
@@ -1410,62 +1808,66 @@ async def cat_new_word_handler(message: types.Message, state: FSMContext):
     data    = await state.get_data()
     cid     = data.get("target_cat_id")
     lines   = message.text.strip().split('\n')
-    added, duplicates, errors = 0, [], []
 
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        parsed = parse_word_line(line)
-        if not parsed:
-            errors.append(line)
-            continue
-        article, german, uzbek = parsed
-        # Duplicate tekshirish
-        cursor.execute(
-            "SELECT id FROM words WHERE LOWER(german)=LOWER(?) AND LOWER(article)=LOWER(?)",
-            (german, article)
-        )
-        existing = cursor.fetchone()
-        if existing:
-            # Mavjud so'zni kategoriyaga biriktirish
-            cursor.execute("UPDATE words SET category_id=? WHERE id=?", (cid, existing[0]))
-            duplicates.append(format_german(german, article))
-        else:
-            # Yangi so'z — umumiy DB + kategoriyaga
-            cursor.execute(
-                "INSERT INTO words (german, uzbek, article, category_id) VALUES (?, ?, ?, ?)",
-                (german, uzbek, article, cid)
-            )
-            added += 1
-
-    if added > 0 or duplicates:
-        conn.commit()
-
-    # Kategoriya nomini olish
-    cursor.execute("SELECT name FROM categories WHERE id=?", (cid,))
-    cat_row = cursor.fetchone()
-    cat_name = cat_row[0] if cat_row else "Kategoriya"
-
-    parts = []
-    if added:
-        parts.append(f"✅ *{added} ta yangi so'z* qo'shildi va *{cat_name}* ga saqlandi!")
-    if duplicates:
-        parts.append(
-            f"🔗 Allaqachon mavjud, kategoriyaga biriktirildi: "
-            f"{', '.join(f'`{w}`' for w in duplicates[:5])}"
-        )
-    if errors:
-        parts.append(f"❓ Format noto'g'ri ({len(errors)} ta):\n_Format: `der Tisch - stol`_")
-    if not parts:
-        parts.append("❓ Hech narsa qo'shilmadi.\n_Format: `der Tisch - stol`_")
-
-    kb = InlineKeyboardMarkup(row_width=1)
-    kb.add(
-        InlineKeyboardButton("➕ Yana so'z qo'shish",     callback_data=f"cat_newword_{cid}"),
-        InlineKeyboardButton("◀️ Kategoriyaga qaytish", callback_data=f"cat_open_{cid}"),
+    # "Bo'lim:" formati bormi?
+    has_subcat_format = any(
+        l.strip().endswith(":") and not _looks_like_word_line(l.strip())
+        for l in lines if l.strip()
     )
-    await message.reply("\n".join(parts), reply_markup=kb, parse_mode="Markdown")
+
+    if has_subcat_format:
+        # Sub-kategoriya sifatida qo'shish (parent_id = cid)
+        await _bulk_add_with_categories(message, lines, parent_id=cid)
+    else:
+        # Oddiy so'zlar — to'g'ridan cid ga
+        added, duplicates, errors = 0, [], []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            parsed = parse_word_line(line)
+            if not parsed:
+                errors.append(line)
+                continue
+            article, german, uzbek = parsed
+            cursor.execute(
+                "SELECT id FROM words WHERE LOWER(german)=LOWER(?) AND LOWER(article)=LOWER(?)",
+                (german, article)
+            )
+            existing = cursor.fetchone()
+            if existing:
+                cursor.execute("UPDATE words SET category_id=? WHERE id=?", (cid, existing[0]))
+                duplicates.append(format_german(german, article))
+            else:
+                cursor.execute(
+                    "INSERT INTO words (german, uzbek, article, category_id) VALUES (?, ?, ?, ?)",
+                    (german, uzbek, article, cid)
+                )
+                added += 1
+        if added > 0 or duplicates:
+            conn.commit()
+
+        cursor.execute("SELECT name FROM categories WHERE id=?", (cid,))
+        cat_row = cursor.fetchone()
+        cat_name = cat_row[0] if cat_row else "Kategoriya"
+
+        parts = []
+        if added:
+            parts.append(f"✅ *{added} ta yangi so'z* qo'shildi → *{cat_name}*")
+        if duplicates:
+            parts.append(f"🔗 Mavjud, biriktirildi: {', '.join(f'`{w}`' for w in duplicates[:5])}")
+        if errors:
+            parts.append(f"❓ Format noto'g'ri ({len(errors)} ta):\n_Format: `der Tisch - stol`_")
+        if not parts:
+            parts.append("❓ Hech narsa qo'shilmadi.\n_Format: `der Tisch - stol`_")
+
+        kb = InlineKeyboardMarkup(row_width=1)
+        kb.add(
+            InlineKeyboardButton("➕ Yana so'z qo'shish",      callback_data=f"cat_newword_{cid}"),
+            InlineKeyboardButton("◀️ Kategoriyaga qaytish",  callback_data=f"cat_open_{cid}"),
+        )
+        await message.reply("\n".join(parts), reply_markup=kb, parse_mode="Markdown")
+
     await state.finish()
 
 # ======================
