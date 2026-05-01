@@ -36,6 +36,7 @@ class QuizState(StatesGroup):
 class CategoryState(StatesGroup):
     waiting_name        = State()
     waiting_assign_word = State()
+    waiting_new_word    = State()   # Kategoriyaga yangi so'z qo'shish
 
 class ReminderState(StatesGroup):
     waiting_time = State()
@@ -1145,14 +1146,156 @@ async def process_callback(call: types.CallbackQuery, state: FSMContext):
         if not row:
             await call.answer("Topilmadi.", show_alert=True)
             return
+        cursor.execute("SELECT COUNT(*) FROM words WHERE category_id=? AND archived=0", (cid,))
+        cnt = cursor.fetchone()[0]
         kb = InlineKeyboardMarkup(row_width=1)
         kb.add(
-            InlineKeyboardButton("🎯 Test boshlash",     callback_data=f"cat_test_{cid}"),
-            InlineKeyboardButton("📋 So'zlarini ko'rish", callback_data=f"cat_list_{cid}"),
-            InlineKeyboardButton("🔗 So'z biriktirish",   callback_data=f"cat_assign_{cid}"),
-            InlineKeyboardButton("🗑 Kategoriyani o'chirish", callback_data=f"cat_del_{cid}"),
+            InlineKeyboardButton("🎯 Test boshlash",            callback_data=f"cat_test_{cid}"),
+            InlineKeyboardButton("📋 So'zlarini ko'rish",        callback_data=f"cat_list_{cid}"),
+            InlineKeyboardButton("➕ So'z qo'shish",             callback_data=f"cat_addword_{cid}"),
+            InlineKeyboardButton("🔗 Mavjud so'z biriktirish",   callback_data=f"cat_assign_{cid}"),
+            InlineKeyboardButton("🗑 Kategoriyani o'chirish",    callback_data=f"cat_del_{cid}"),
         )
-        await call.message.edit_text(f"📁 *{row[0]}*", reply_markup=kb, parse_mode="Markdown")
+        await call.message.edit_text(
+            f"📁 *{row[0]}*\n_{cnt} ta so'z_",
+            reply_markup=kb, parse_mode="Markdown"
+        )
+
+    elif d.startswith("cat_addword_"):
+        cid = int(d.split("_")[2])
+        cursor.execute("SELECT name FROM categories WHERE id=?", (cid,))
+        row = cursor.fetchone()
+        if not row:
+            await call.answer("Topilmadi.", show_alert=True)
+            return
+        cat_name = row[0]
+
+        # Kategoriyaga hali biriktirilmagan mavjud so'zlar sonini ko'rsatamiz
+        cursor.execute(
+            "SELECT COUNT(*) FROM words WHERE (category_id IS NULL OR category_id != ?) AND archived=0",
+            (cid,)
+        )
+        free_cnt = cursor.fetchone()[0]
+
+        kb = InlineKeyboardMarkup(row_width=1)
+        kb.add(
+            InlineKeyboardButton(
+                f"📚 Mavjud so'zlardan qo'shish ({free_cnt} ta)",
+                callback_data=f"cat_fromexisting_{cid}"
+            ),
+            InlineKeyboardButton(
+                "✏️ Yangi so'z qo'shish",
+                callback_data=f"cat_newword_{cid}"
+            ),
+            InlineKeyboardButton("◀️ Orqaga", callback_data=f"cat_open_{cid}"),
+        )
+        await call.message.edit_text(
+            f"📁 *{cat_name}* — So'z qo'shish\n\n"
+            "Qanday qo'shmoqchisiz?",
+            reply_markup=kb, parse_mode="Markdown"
+        )
+
+    elif d.startswith("cat_fromexisting_"):
+        cid = int(d.split("_")[2])
+        cursor.execute("SELECT name FROM categories WHERE id=?", (cid,))
+        row = cursor.fetchone()
+        if not row:
+            await call.answer("Topilmadi.", show_alert=True)
+            return
+        cat_name = row[0]
+
+        # Bu kategoriyada bo'lmagan so'zlarni ko'rsatish (max 30 ta)
+        cursor.execute(
+            """SELECT id, german, article, uzbek FROM words
+               WHERE (category_id IS NULL OR category_id != ?) AND archived=0
+               ORDER BY german LIMIT 30""",
+            (cid,)
+        )
+        words = cursor.fetchall()
+        if not words:
+            await call.answer("Birikmagan so'z topilmadi!", show_alert=True)
+            return
+
+        kb = InlineKeyboardMarkup(row_width=1)
+        for wid, german, article, uzbek in words:
+            display = format_german(german, article)
+            kb.add(InlineKeyboardButton(
+                f"➕ {display} — {uzbek}",
+                callback_data=f"cat_pick_{cid}_{wid}"
+            ))
+        kb.add(InlineKeyboardButton("◀️ Orqaga", callback_data=f"cat_addword_{cid}"))
+
+        await call.message.edit_text(
+            f"📚 *{cat_name}* ga qo'shish\n\n"
+            "Qaysi so'zni qo'shmoqchisiz?",
+            reply_markup=kb, parse_mode="Markdown"
+        )
+
+    elif d.startswith("cat_pick_"):
+        parts = d.split("_")
+        cid  = int(parts[2])
+        wid  = int(parts[3])
+        cursor.execute("UPDATE words SET category_id=? WHERE id=?", (cid, wid))
+        conn.commit()
+        cursor.execute("SELECT german, article FROM words WHERE id=?", (wid,))
+        w = cursor.fetchone()
+        cursor.execute("SELECT name FROM categories WHERE id=?", (cid,))
+        cat_row = cursor.fetchone()
+        if w and cat_row:
+            display = format_german(w[0], w[1])
+            await call.answer(f"✅ '{display}' qo'shildi!", show_alert=False)
+        # Ro'yxatni yangilaymiz
+        cursor.execute(
+            """SELECT id, german, article, uzbek FROM words
+               WHERE (category_id IS NULL OR category_id != ?) AND archived=0
+               ORDER BY german LIMIT 30""",
+            (cid,)
+        )
+        words = cursor.fetchall()
+        cursor.execute("SELECT name FROM categories WHERE id=?", (cid,))
+        cat_name = cursor.fetchone()[0]
+
+        if not words:
+            kb2 = InlineKeyboardMarkup()
+            kb2.add(InlineKeyboardButton("◀️ Kategoriyaga qaytish", callback_data=f"cat_open_{cid}"))
+            await call.message.edit_text(
+                f"✅ Barcha mavjud so'zlar *{cat_name}* ga qo'shildi!",
+                reply_markup=kb2, parse_mode="Markdown"
+            )
+            return
+
+        kb2 = InlineKeyboardMarkup(row_width=1)
+        for wid2, german, article, uzbek in words:
+            display = format_german(german, article)
+            kb2.add(InlineKeyboardButton(
+                f"➕ {display} — {uzbek}",
+                callback_data=f"cat_pick_{cid}_{wid2}"
+            ))
+        kb2.add(InlineKeyboardButton("◀️ Orqaga", callback_data=f"cat_addword_{cid}"))
+        await call.message.edit_text(
+            f"📚 *{cat_name}* ga qo'shish\n\nQaysi so'zni qo'shmoqchisiz?",
+            reply_markup=kb2, parse_mode="Markdown"
+        )
+
+    elif d.startswith("cat_newword_"):
+        cid = int(d.split("_")[2])
+        cursor.execute("SELECT name FROM categories WHERE id=?", (cid,))
+        row = cursor.fetchone()
+        if not row:
+            await call.answer("Topilmadi.", show_alert=True)
+            return
+        await state.update_data(target_cat_id=cid)
+        await call.message.answer(
+            f"✏️ *{row[0]}* kategoriyasiga yangi so'z qo'shish\n\n"
+            "So'zlarni quyidagi formatda yozing:\n"
+            "`der Tisch - stol`\n"
+            "`laufen - yugurmoq`\n"
+            "_(Bir nechta qator ham bo'ladi)_\n\n"
+            "Bekor qilish: /start",
+            parse_mode="Markdown"
+        )
+        await CategoryState.waiting_new_word.set()
+
 
     elif d.startswith("cat_test_"):
         cid = int(d.split("_")[2])
@@ -1255,6 +1398,75 @@ async def cat_assign_words(message: types.Message, state: FSMContext):
     if not_found:
         parts.append(f"⚠️ Topilmadi: {', '.join(f'`{w}`' for w in not_found[:5])}")
     await message.answer("\n".join(parts) or "Hech narsa topilmadi.", parse_mode="Markdown")
+
+
+@dp.message_handler(state=CategoryState.waiting_new_word)
+async def cat_new_word_handler(message: types.Message, state: FSMContext):
+    """Kategoriyaga to'g'ridan-to'g'ri yangi so'z qo'shish"""
+    if message.text.startswith("/"):
+        await state.finish()
+        return
+
+    data    = await state.get_data()
+    cid     = data.get("target_cat_id")
+    lines   = message.text.strip().split('\n')
+    added, duplicates, errors = 0, [], []
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        parsed = parse_word_line(line)
+        if not parsed:
+            errors.append(line)
+            continue
+        article, german, uzbek = parsed
+        # Duplicate tekshirish
+        cursor.execute(
+            "SELECT id FROM words WHERE LOWER(german)=LOWER(?) AND LOWER(article)=LOWER(?)",
+            (german, article)
+        )
+        existing = cursor.fetchone()
+        if existing:
+            # Mavjud so'zni kategoriyaga biriktirish
+            cursor.execute("UPDATE words SET category_id=? WHERE id=?", (cid, existing[0]))
+            duplicates.append(format_german(german, article))
+        else:
+            # Yangi so'z — umumiy DB + kategoriyaga
+            cursor.execute(
+                "INSERT INTO words (german, uzbek, article, category_id) VALUES (?, ?, ?, ?)",
+                (german, uzbek, article, cid)
+            )
+            added += 1
+
+    if added > 0 or duplicates:
+        conn.commit()
+
+    # Kategoriya nomini olish
+    cursor.execute("SELECT name FROM categories WHERE id=?", (cid,))
+    cat_row = cursor.fetchone()
+    cat_name = cat_row[0] if cat_row else "Kategoriya"
+
+    parts = []
+    if added:
+        parts.append(f"✅ *{added} ta yangi so'z* qo'shildi va *{cat_name}* ga saqlandi!")
+    if duplicates:
+        parts.append(
+            f"🔗 Allaqachon mavjud, kategoriyaga biriktirildi: "
+            f"{', '.join(f'`{w}`' for w in duplicates[:5])}"
+        )
+    if errors:
+        parts.append(f"❓ Format noto'g'ri ({len(errors)} ta):\n_Format: `der Tisch - stol`_")
+    if not parts:
+        parts.append("❓ Hech narsa qo'shilmadi.\n_Format: `der Tisch - stol`_")
+
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        InlineKeyboardButton("➕ Yana so'z qo'shish",     callback_data=f"cat_newword_{cid}"),
+        InlineKeyboardButton("◀️ Kategoriyaga qaytish", callback_data=f"cat_open_{cid}"),
+    )
+    await message.reply("\n".join(parts), reply_markup=kb, parse_mode="Markdown")
+    await state.finish()
 
 # ======================
 # MAIN
